@@ -208,9 +208,9 @@ jobs:
 `
 
 	expectedPerms := map[string]*repo_model.ActionsTokenPermissions{}
-	expectedPerms["job-read-only"] = new(repo_model.MakeActionsTokenPermissions(perm.AccessModeRead))
-	expectedPerms["job-none-perms"] = new(repo_model.MakeActionsTokenPermissions(perm.AccessModeNone))
-	expectedPerms["job-override"] = new(repo_model.MakeActionsTokenPermissions(perm.AccessModeNone))
+	expectedPerms["job-read-only"] = actionsTokenPermissionsPtr(repo_model.MakeActionsTokenPermissions(perm.AccessModeRead))
+	expectedPerms["job-none-perms"] = actionsTokenPermissionsPtr(repo_model.MakeActionsTokenPermissions(perm.AccessModeNone))
+	expectedPerms["job-override"] = actionsTokenPermissionsPtr(repo_model.MakeActionsTokenPermissions(perm.AccessModeNone))
 	expectedPerms["job-override"].UnitAccessModes[unit.TypeCode] = perm.AccessModeWrite
 	expectedPerms["job-override"].UnitAccessModes[unit.TypeReleases] = perm.AccessModeWrite
 
