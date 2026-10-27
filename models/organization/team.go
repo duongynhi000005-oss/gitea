@@ -6,6 +6,7 @@ package organization
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -14,6 +15,7 @@ import (
 	"gitea.dev/models/unit"
 	user_model "gitea.dev/models/user"
 	"gitea.dev/modules/log"
+	"gitea.dev/modules/structs"
 	"gitea.dev/modules/util"
 
 	"xorm.io/builder"
@@ -72,18 +74,63 @@ const OwnerTeamName = "Owners"
 
 // Team represents a organization team.
 type Team struct {
-	ID                      int64 `xorm:"pk autoincr"`
-	OrgID                   int64 `xorm:"INDEX"`
-	LowerName               string
-	Name                    string
-	Description             string
-	AccessMode              perm.AccessMode    `xorm:"'authorize'"`
-	Members                 []*user_model.User `xorm:"-"`
-	NumRepos                int
-	NumMembers              int
-	Units                   []*TeamUnit `xorm:"-"`
-	IncludesAllRepositories bool        `xorm:"NOT NULL DEFAULT false"`
-	CanCreateOrgRepo        bool        `xorm:"NOT NULL DEFAULT false"`
+	ID          int64 `xorm:"pk autoincr"`
+	OrgID       int64 `xorm:"INDEX"`
+	LowerName   string
+	Name        string
+	Description string
+	AccessMode  perm.AccessMode    `xorm:"'authorize'"`
+	Members     []*user_model.User `xorm:"-"`
+	NumRepos    int
+	NumMembers  int
+	Units       []*TeamUnit `xorm:"-"`
+
+	// All repos in the org are included in this team automatically
+	IncludesAllRepositories bool `xorm:"NOT NULL DEFAULT false"`
+
+	// Any user with CanCreateOrgRepo permission can create a repository in the organization, regardless of team membership.
+	// And the user will become the repo's admin (via collaborator) after the creation.
+	CanCreateOrgRepo bool `xorm:"NOT NULL DEFAULT false"`
+
+	Visibility structs.VisibleType `xorm:"NOT NULL DEFAULT 2"`
+
+	// ParentID references an optional parent team/subgroup within the same organization (0 for top-level).
+	ParentID int64 `xorm:"INDEX NOT NULL DEFAULT 0"`
+}
+
+func (t *Team) IsPublic() bool  { return t.Visibility.IsPublic() }
+func (t *Team) IsLimited() bool { return t.Visibility.IsLimited() }
+func (t *Team) IsPrivate() bool { return t.Visibility.IsPrivate() }
+
+const (
+	ghostTeamID   = -1
+	ghostTeamName = "(deleted team)"
+)
+
+func newGhostTeam() *Team {
+	return &Team{ID: ghostTeamID, Name: ghostTeamName, LowerName: ghostTeamName}
+}
+
+// CanNonMemberReadMeta reports whether a non-member, non-owner doer may read
+// the team's metadata, based on the team's visibility tier and the parent org's
+// visibility. Privileged callers (site admins, org owners, team members) are
+// decided by the caller before reaching here.
+func (t *Team) CanNonMemberReadMeta(ctx context.Context, org, doer *user_model.User) (bool, error) {
+	switch t.Visibility {
+	case structs.VisibleTypePublic:
+		return HasOrgOrUserVisible(ctx, org, doer), nil
+	case structs.VisibleTypeLimited:
+		return IsOrganizationMember(ctx, t.OrgID, doer.ID)
+	default:
+		return false, nil
+	}
+}
+
+func NormalizeTeamVisibility[T ~string](v T) structs.VisibleType {
+	if vt, ok := structs.VisibilityModes[structs.VisibilityString(v)]; ok {
+		return vt
+	}
+	return structs.VisibleTypePrivate
 }
 
 func init() {
@@ -111,29 +158,14 @@ func (t *Team) LoadUnits(ctx context.Context) (err error) {
 	return err
 }
 
-// GetUnitNames returns the team units names
-func (t *Team) GetUnitNames() (res []string) {
-	if t.HasAdminAccess() {
-		return unit.AllUnitKeyNames()
-	}
-
-	for _, u := range t.Units {
-		res = append(res, unit.Units[u.Type].NameKey)
-	}
-	return res
-}
-
 // GetUnitsMap returns the team units permissions
 func (t *Team) GetUnitsMap() map[string]string {
+	if len(t.Units) == 0 {
+		return nil
+	}
 	m := make(map[string]string)
-	if t.HasAdminAccess() {
-		for _, u := range unit.Units {
-			m[u.NameKey] = t.AccessMode.ToString()
-		}
-	} else {
-		for _, u := range t.Units {
-			m[u.Unit().NameKey] = u.AccessMode.ToString()
-		}
+	for _, u := range t.Units {
+		m[u.Unit().NameKey] = u.AccessMode.ToString()
 	}
 	return m
 }
@@ -151,10 +183,6 @@ func (t *Team) IsMember(ctx context.Context, userID int64) bool {
 		return false
 	}
 	return isMember
-}
-
-func (t *Team) HasAdminAccess() bool {
-	return t.AccessMode >= perm.AccessModeAdmin
 }
 
 // LoadMembers returns paginated members in team of organization.
@@ -176,16 +204,21 @@ func (t *Team) UnitAccessMode(ctx context.Context, tp unit.Type) perm.AccessMode
 	return accessMode
 }
 
-func (t *Team) UnitAccessModeEx(ctx context.Context, tp unit.Type) (accessMode perm.AccessMode, exist bool) {
+func (t *Team) UnitAccessModeEx(ctx context.Context, tp unit.Type) (mode perm.AccessMode, exist bool) {
 	if err := t.LoadUnits(ctx); err != nil {
-		log.Warn("Error loading team (ID: %d) units: %s", t.ID, err.Error())
+		log.Error("Error loading team (ID: %d) units: %v", t.ID, err)
 	}
 	for _, u := range t.Units {
 		if u.Type == tp {
-			return u.AccessMode, true
+			mode, exist = u.AccessMode, true
+			break
 		}
 	}
-	return perm.AccessModeNone, false
+	mode = max(mode, t.AccessMode)
+	if unitDef, ok := unit.Units[tp]; ok {
+		mode = min(mode, unitDef.MaxPerm())
+	}
+	return mode, exist || t.AccessMode > perm.AccessModeNone
 }
 
 // IsUsableTeamName tests if a name could be as team name
@@ -242,8 +275,139 @@ func GetTeamByID(ctx context.Context, teamID int64) (*Team, error) {
 	return t, nil
 }
 
+func GetPossibleTeamByID(ctx context.Context, teamID int64) (int64, *Team, error) {
+	t, err := GetTeamByID(ctx, teamID)
+	if errors.Is(err, util.ErrNotExist) {
+		t = newGhostTeam()
+		return t.ID, t, nil
+	} else if err != nil {
+		return 0, nil, err
+	}
+	return t.ID, t, nil
+}
+
 // IncrTeamRepoNum increases the number of repos for the given team by 1
 func IncrTeamRepoNum(ctx context.Context, teamID int64) error {
 	_, err := db.GetEngine(ctx).Incr("num_repos").ID(teamID).Update(new(Team))
 	return err
+}
+
+// MaxSubgroupDepth defines the maximum allowed nesting depth for subgroups/subteams.
+const MaxSubgroupDepth = 20
+
+// ErrSubgroupHierarchy represents an invalid parent-child subgroup relationship (cross-org, cycle, or max depth exceeded).
+type ErrSubgroupHierarchy struct {
+	OrgID    int64
+	TeamID   int64
+	ParentID int64
+	Reason   string
+}
+
+// IsErrSubgroupHierarchy checks if an error is an ErrSubgroupHierarchy.
+func IsErrSubgroupHierarchy(err error) bool {
+	_, ok := err.(ErrSubgroupHierarchy)
+	return ok
+}
+
+func (err ErrSubgroupHierarchy) Error() string {
+	return fmt.Sprintf("invalid subgroup hierarchy [org_id: %d, team_id: %d, parent_id: %d]: %s", err.OrgID, err.TeamID, err.ParentID, err.Reason)
+}
+
+func (err ErrSubgroupHierarchy) Unwrap() error {
+	return util.ErrInvalidArgument
+}
+
+// ValidateParentTeam verifies that assigning parentID as the parent of teamID in orgID
+// stays within the same organization, introduces no cycle, and does not exceed MaxSubgroupDepth.
+func ValidateParentTeam(ctx context.Context, orgID, teamID, parentID int64) error {
+	if parentID == 0 {
+		return nil
+	}
+	if parentID < 0 {
+		return ErrSubgroupHierarchy{OrgID: orgID, TeamID: teamID, ParentID: parentID, Reason: "negative parent team ID"}
+	}
+	if teamID > 0 && parentID == teamID {
+		return ErrSubgroupHierarchy{OrgID: orgID, TeamID: teamID, ParentID: parentID, Reason: "team cannot be its own parent"}
+	}
+
+	visited := make(map[int64]struct{}, MaxSubgroupDepth+1)
+	if teamID > 0 {
+		visited[teamID] = struct{}{}
+	}
+
+	currID := parentID
+	for depth := 1; currID > 0; depth++ {
+		if depth > MaxSubgroupDepth {
+			return ErrSubgroupHierarchy{OrgID: orgID, TeamID: teamID, ParentID: parentID, Reason: fmt.Sprintf("exceeds maximum subgroup depth of %d", MaxSubgroupDepth)}
+		}
+		if _, seen := visited[currID]; seen {
+			return ErrSubgroupHierarchy{OrgID: orgID, TeamID: teamID, ParentID: parentID, Reason: "cyclic subgroup parent chain"}
+		}
+		visited[currID] = struct{}{}
+
+		parent, err := GetTeamByID(ctx, currID)
+		if err != nil {
+			return err
+		}
+		if parent.OrgID != orgID {
+			return ErrSubgroupHierarchy{OrgID: orgID, TeamID: teamID, ParentID: parentID, Reason: "parent team belongs to a different organization"}
+		}
+		currID = parent.ParentID
+	}
+	return nil
+}
+
+// FindOrgSubteams returns all direct child subteams under parentID within orgID.
+func FindOrgSubteams(ctx context.Context, orgID, parentID int64) ([]*Team, error) {
+	var teams []*Team
+	return teams, db.GetEngine(ctx).
+		Where("org_id=? AND parent_id=?", orgID, parentID).
+		OrderBy("name ASC").
+		Find(&teams)
+}
+
+// GetSubteams returns all direct child subteams of t.
+func (t *Team) GetSubteams(ctx context.Context) ([]*Team, error) {
+	return FindOrgSubteams(ctx, t.OrgID, t.ID)
+}
+
+// GetAncestorTeams returns the ancestor chain of t from immediate parent up to the root team.
+func (t *Team) GetAncestorTeams(ctx context.Context) ([]*Team, error) {
+	if t.ParentID <= 0 {
+		return nil, nil
+	}
+	ancestors := make([]*Team, 0, 4)
+	visited := map[int64]struct{}{t.ID: {}}
+	currID := t.ParentID
+	for len(ancestors) < MaxSubgroupDepth && currID > 0 {
+		if _, seen := visited[currID]; seen {
+			return nil, ErrSubgroupHierarchy{OrgID: t.OrgID, TeamID: t.ID, ParentID: t.ParentID, Reason: "cyclic subgroup parent chain"}
+		}
+		visited[currID] = struct{}{}
+		parent, err := GetTeamByID(ctx, currID)
+		if err != nil {
+			return nil, err
+		}
+		if parent.OrgID != t.OrgID {
+			return nil, ErrSubgroupHierarchy{OrgID: t.OrgID, TeamID: t.ID, ParentID: t.ParentID, Reason: "parent team belongs to a different organization"}
+		}
+		ancestors = append(ancestors, parent)
+		currID = parent.ParentID
+	}
+	return ancestors, nil
+}
+
+// EffectiveUnitAccessMode returns the effective access mode for tp on t, inheriting the maximum
+// unit access mode granted by t or any of its ancestor teams in the hierarchy.
+func (t *Team) EffectiveUnitAccessMode(ctx context.Context, tp unit.Type) perm.AccessMode {
+	mode := t.UnitAccessMode(ctx, tp)
+	ancestors, err := t.GetAncestorTeams(ctx)
+	if err != nil {
+		log.Error("GetAncestorTeams (team_id: %d): %v", t.ID, err)
+		return mode
+	}
+	for _, anc := range ancestors {
+		mode = max(mode, anc.UnitAccessMode(ctx, tp))
+	}
+	return mode
 }
