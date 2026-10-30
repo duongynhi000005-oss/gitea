@@ -221,6 +221,11 @@ func GetOIDCEndSessionEndpoint(providerName string) string {
 var ErrAuthSourceNotActivated = errors.New("auth source is not activated")
 
 // used to create different types of goth providers
+func GetOAuth2CallbackURL(ctx context.Context, providerName string) string {
+	appURL := httplib.GuessCurrentAppURL(ctx)
+	return appURL + "user/oauth2/" + url.PathEscape(providerName) + "/callback"
+}
+
 func createProvider(providerName string, source *Source) (goth.Provider, error) {
 	callbackURL := setting.AppURL + "user/oauth2/" + url.PathEscape(providerName) + "/callback"
 
